@@ -1,0 +1,267 @@
+#!/bin/bash
+
+# Gmail CLI wrapper using gmcli with caching
+ACCOUNT="${GMAIL_ACCOUNT:-}"
+LIMIT="${GMAIL_LIMIT:-10}"
+CACHE_DIR="$HOME/.cache/mdos"
+CACHE_TTL=30  # 30 seconds for faster updates
+
+if [ -z "$ACCOUNT" ]; then
+  echo "Error: No email account configured. Set GMAIL_ACCOUNT or add accounts to config.json"
+  exit 1
+fi
+
+mkdir -p "$CACHE_DIR"
+
+# Cache helper functions
+cache_file() {
+  echo "$CACHE_DIR/${ACCOUNT}_$1.cache"
+}
+
+cache_valid() {
+  local file="$1"
+  if [ ! -f "$file" ]; then
+    return 1
+  fi
+  local age=$(( $(date +%s) - $(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null) ))
+  [ "$age" -lt "$CACHE_TTL" ]
+}
+
+case "$1" in
+  inbox)
+    # Parse arguments
+    MAX="$LIMIT"
+    FORMAT="default"
+    SHOW_ACTIONS=true
+    REFRESH=false
+    
+    shift # remove 'inbox'
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --format=*) FORMAT="${1#*=}" ;;
+        --no-actions) SHOW_ACTIONS=false ;;
+        --refresh) REFRESH=true ;;
+        [0-9]*) MAX="$1" ;;
+      esac
+      shift
+    done
+    
+    CACHE=$(cache_file "inbox_${MAX}_${FORMAT}_${SHOW_ACTIONS}")
+    
+    if [ "$REFRESH" = true ]; then
+      rm -f "$CACHE_DIR/${ACCOUNT}"_inbox_*.cache
+    fi
+    
+    if cache_valid "$CACHE"; then
+      cat "$CACHE"
+      exit 0
+    fi
+    
+    # Fetch and format
+    {
+      # Table header
+      if [[ "$FORMAT" == *"table"* ]]; then
+        echo "| | From | Subject | Date |${SHOW_ACTIONS:+ Actions |}"
+        echo "|---|------|---------|------|${SHOW_ACTIONS:+--------|}"
+      fi
+      
+      gmcli "$ACCOUNT" search "in:inbox" --max "$MAX" 2>/dev/null | tail -n +2 | grep -v "^#" | grep -v "^$" | while IFS=$'\t' read -r id date from subject labels; do
+        [ -z "$id" ] && continue
+        [[ "$id" == *"Next page"* ]] && continue
+        
+        from_name=$(echo "$from" | sed 's/<[^>]*>//g' | sed 's/^ *//;s/ *$//' | cut -c1-25)
+        subject_clean=$(echo "$subject" | cut -c1-60)
+        date_short=$(echo "$date" | cut -d' ' -f1 | cut -c6-)
+        
+        is_unread=false
+        echo "$labels" | grep -q "UNREAD" && is_unread=true
+        
+        # Build actions string
+        actions=""
+        if [ "$SHOW_ACTIONS" = true ]; then
+          actions="[Archive](#archive-${id}) · [Mark read](#mark-read-${id})"
+        fi
+        
+        # Format: terminal (HTML for keyboard navigation)
+        if [[ "$FORMAT" == *"terminal"* ]]; then
+          unread_class=""
+          unread_marker=""
+          [ "$is_unread" = true ] && unread_class=" unread" && unread_marker="<span class=\"unread\">●</span> "
+          echo "<div class=\"item${unread_class}\" data-thread-id=\"${id}\"><span class=\"checkbox\">[ ]</span>${unread_marker}<a href=\"?view=${id}\" class=\"from\">${from_name}</a><span class=\"subject\">${subject_clean}</span><span class=\"date\">${date_short}</span></div>"
+        
+        # Format: checklist
+        elif [[ "$FORMAT" == *"checklist"* ]]; then
+          checkbox="[ ]"
+          [ "$is_unread" = true ] && checkbox="[●]"
+          
+          if [[ "$FORMAT" == *"compact"* ]]; then
+            # checklist + compact
+            echo "- ${checkbox} [${from_name}](?view=${id}) · ${subject_clean} *${date_short}*${actions:+ · $actions}"
+          else
+            # checklist only
+            echo "- ${checkbox} **[${from_name}](?view=${id})** · ${subject_clean}"
+            echo "  *${date_short}*${actions:+ · $actions}"
+            echo ""
+          fi
+        
+        # Format: compact
+        elif [[ "$FORMAT" == *"compact"* ]]; then
+          marker=""
+          [ "$is_unread" = true ] && marker="● "
+          echo "${marker}[${from_name}](?view=${id}) · ${subject_clean} · *${date_short}*${actions:+ · $actions}"
+        
+        # Format: table
+        elif [[ "$FORMAT" == *"table"* ]]; then
+          marker=""
+          [ "$is_unread" = true ] && marker="●"
+          echo "| ${marker} | [${from_name}](?view=${id}) | ${subject_clean} | ${date_short} |${SHOW_ACTIONS:+ $actions |}"
+        
+        # Default format
+        else
+          if [ "$is_unread" = true ]; then
+            echo "● **[${from_name}](?view=${id})** · ${subject_clean}"
+          else
+            echo "[${from_name}](?view=${id}) · ${subject_clean}"
+          fi
+          echo ""
+          echo "*${date_short}*${actions:+ · $actions}"
+          echo ""
+          echo "---"
+          echo ""
+        fi
+      done
+    } | tee "$CACHE"
+    ;;
+
+  thread)
+    THREAD_ID="$2"
+    if [ -z "$THREAD_ID" ]; then
+      # No thread ID - output nothing (widget will be empty)
+      exit 0
+    fi
+    
+    CACHE=$(cache_file "thread_${THREAD_ID}")
+    
+    # Return cached if valid (threads cached for 1 hour)
+    THREAD_TTL=3600
+    if [ -f "$CACHE" ]; then
+      age=$(( $(date +%s) - $(stat -f %m "$CACHE" 2>/dev/null || stat -c %Y "$CACHE" 2>/dev/null) ))
+      if [ "$age" -lt "$THREAD_TTL" ]; then
+        cat "$CACHE"
+        exit 0
+      fi
+    fi
+    
+    # Fetch and cache
+    {
+      CONTENT=$(gmcli "$ACCOUNT" thread "$THREAD_ID" 2>/dev/null)
+      
+      FROM=$(echo "$CONTENT" | grep -m1 "^From:" | sed 's/From: //')
+      TO=$(echo "$CONTENT" | grep -m1 "^To:" | sed 's/To: //')
+      DATE=$(echo "$CONTENT" | grep -m1 "^Date:" | sed 's/Date: //')
+      SUBJECT=$(echo "$CONTENT" | grep -m1 "^Subject:" | sed 's/Subject: //')
+      BODY=$(echo "$CONTENT" | sed -n '/^$/,$p' | tail -n +2)
+      
+      echo "[← Back](/) | [Archive](#archive-${THREAD_ID}) | [Reply](#reply-${THREAD_ID})"
+      echo ""
+      echo "## ${SUBJECT}"
+      echo ""
+      echo "**From:** ${FROM}  "
+      echo "**To:** ${TO}  "
+      echo "**Date:** ${DATE}"
+      echo ""
+      echo "---"
+      echo ""
+      echo "$BODY"
+    } | tee "$CACHE"
+    ;;
+
+  archive)
+    THREAD_ID="$2"
+    [ -z "$THREAD_ID" ] && { echo "Error: No thread ID"; exit 1; }
+    gmcli "$ACCOUNT" labels "$THREAD_ID" --remove INBOX 2>/dev/null
+    rm -f "$CACHE_DIR/${ACCOUNT}"_*.cache  # Invalidate cache
+    echo "Archived"
+    ;;
+
+  mark-read)
+    THREAD_ID="$2"
+    [ -z "$THREAD_ID" ] && { echo "Error: No thread ID"; exit 1; }
+    gmcli "$ACCOUNT" labels "$THREAD_ID" --remove UNREAD 2>/dev/null
+    rm -f "$CACHE_DIR/${ACCOUNT}"_*.cache  # Invalidate cache
+    echo "Marked as read"
+    ;;
+
+  archive-selected)
+    # Archive multiple threads (IDs passed as args)
+    shift
+    for id in "$@"; do
+      gmcli "$ACCOUNT" labels "$id" --remove INBOX 2>/dev/null
+    done
+    echo "Archived $# threads"
+    ;;
+
+  mark-read-selected)
+    shift
+    for id in "$@"; do
+      gmcli "$ACCOUNT" labels "$id" --remove UNREAD 2>/dev/null
+    done
+    echo "Marked $# as read"
+    ;;
+
+  reply)
+    THREAD_ID="$2"
+    BODY="$3"
+    [ -z "$THREAD_ID" ] || [ -z "$BODY" ] && { echo "Error: Need thread ID and body"; exit 1; }
+    
+    # Get original message details for reply
+    CONTENT=$(gmcli "$ACCOUNT" thread "$THREAD_ID" 2>/dev/null)
+    MSG_ID=$(echo "$CONTENT" | grep -m1 "^Message-ID:" | sed 's/Message-ID: //')
+    FROM=$(echo "$CONTENT" | grep -m1 "^From:" | sed 's/From: //' | grep -oE '[^<]+@[^>]+')
+    SUBJECT=$(echo "$CONTENT" | grep -m1 "^Subject:" | sed 's/Subject: //')
+    
+    # Add Re: if not present
+    [[ "$SUBJECT" != Re:* ]] && SUBJECT="Re: $SUBJECT"
+    
+    gmcli "$ACCOUNT" drafts create --to "$FROM" --subject "$SUBJECT" --body "$BODY" --reply-to "$MSG_ID" 2>/dev/null
+    echo "Draft reply created"
+    ;;
+
+  labels-list)
+    gmcli "$ACCOUNT" labels list 2>/dev/null | grep -v "^CATEGORY_" | grep -v "^CHAT$" | head -20
+    ;;
+
+  add-label)
+    THREAD_ID="$2"
+    LABEL="$3"
+    [ -z "$THREAD_ID" ] || [ -z "$LABEL" ] && { echo "Error: Need thread ID and label"; exit 1; }
+    gmcli "$ACCOUNT" labels "$THREAD_ID" --add "$LABEL" 2>/dev/null
+    echo "Added label: $LABEL"
+    ;;
+
+  count)
+    CACHE=$(cache_file "count")
+    if cache_valid "$CACHE"; then
+      cat "$CACHE"
+      exit 0
+    fi
+    COUNT=$(gmcli "$ACCOUNT" search "in:inbox is:unread" --max 100 2>/dev/null | wc -l | tr -d ' ')
+    echo "$((COUNT > 0 ? COUNT - 1 : 0))" | tee "$CACHE"
+    ;;
+
+  refresh)
+    # Clear all caches for this account
+    rm -f "$CACHE_DIR/${ACCOUNT}"_*.cache
+    echo "Cache cleared"
+    ;;
+
+  accounts)
+    echo "Accounts are configured in config.json"
+    ;;
+
+  *)
+    echo "Gmail CLI"
+    echo "Commands: inbox [limit], thread <id>, archive <id>, mark-read <id>, reply <id> <body>, add-label <id> <label>, count, accounts"
+    exit 1
+    ;;
+esac
